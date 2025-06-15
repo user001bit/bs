@@ -16,11 +16,11 @@ import tempfile
 from pathlib import Path
 
 # Matrix configuration (will be replaced by bot_starter.vbs)
-BOT_NAME = "PLACEHOLDER_BOT_NAME"
-USERNAME = "PLACEHOLDER_USERNAME"
-PASSWORD = "PLACEHOLDER_PASSWORD"
-ROOM_ID = "PLACEHOLDER_ROOM_ID"
-HOMESERVER = "PLACEHOLDER_HOMESERVER"
+BOT_NAME = "PC1"
+USERNAME = "@devotedcomplicationtog:matrix.org"
+PASSWORD = "niggashiman"
+ROOM_ID = "!BjVmLMjhVOsGzoUWPb:matrix.org"
+HOMESERVER = "https://matrix-client.matrix.org"
 
 # Try to import matrix-nio
 try:
@@ -32,7 +32,7 @@ except ImportError:
 
 # Global variables
 client = None
-connection_timestamp = None
+connection_timestamp = None  # This will be in Matrix server time (milliseconds)
 temp_dir = os.environ.get('TEMP', tempfile.gettempdir())
 lock_file = os.path.join(temp_dir, "matrix_bot_temp", "bot.lock")
 running = True
@@ -149,21 +149,65 @@ def restart_pc():
         print(f"Error restarting PC: {e}")
         return False
 
-async def sync_with_server_time():
-    """Sync with Matrix server time"""
+async def establish_connection_timestamp():
+    """Establish connection timestamp using Matrix server time"""
     global connection_timestamp
     
     try:
-        # Make a simple request to get server time
-        response = await client.sync(timeout=1000)
+        print("Establishing connection timestamp with Matrix server...")
+        
+        # Do an initial sync to get server time
+        response = await client.sync(timeout=5000)
+        
         if isinstance(response, SyncResponse):
-            # Use current time as connection timestamp
-            connection_timestamp = datetime.now(timezone.utc).timestamp() * 1000
-            print(f"Synced with server time. Connection timestamp: {connection_timestamp}")
+            # Get the current server timestamp from the sync response
+            # We'll use the next_batch token timestamp or current server time
+            
+            # Send a dummy message to ourselves to get server timestamp
+            try:
+                # Send a message that we can identify and get its server timestamp
+                temp_message = f"__TIMESTAMP_SYNC__{int(time.time())}"
+                await client.room_send(
+                    room_id=ROOM_ID,
+                    message_type="m.room.message",
+                    content={
+                        "msgtype": "m.text",
+                        "body": temp_message
+                    }
+                )
+                
+                # Wait a moment and sync to get the message back with server timestamp
+                await asyncio.sleep(1)
+                sync_response = await client.sync(timeout=5000)
+                
+                if isinstance(sync_response, SyncResponse):
+                    # Look for our timestamp sync message in the room events
+                    room_events = sync_response.rooms.join.get(ROOM_ID)
+                    if room_events and room_events.timeline and room_events.timeline.events:
+                        for event in reversed(room_events.timeline.events):  # Check newest first
+                            if (hasattr(event, 'body') and 
+                                isinstance(event.body, str) and 
+                                event.body.startswith("__TIMESTAMP_SYNC__")):
+                                # Found our sync message, use its server timestamp
+                                connection_timestamp = event.server_timestamp
+                                print(f"Connection timestamp established: {connection_timestamp} (Matrix server time)")
+                                return True
+                
+            except Exception as e:
+                print(f"Error with timestamp sync message method: {e}")
+            
+            # Fallback: use current time converted to milliseconds
+            # This is less accurate but better than nothing
+            connection_timestamp = int(time.time() * 1000)
+            print(f"Connection timestamp established (fallback): {connection_timestamp}")
             return True
+            
     except Exception as e:
-        print(f"Error syncing with server time: {e}")
+        print(f"Error establishing connection timestamp: {e}")
     
+    # Final fallback
+    connection_timestamp = int(time.time() * 1000)
+    print(f"Connection timestamp established (final fallback): {connection_timestamp}")
     return False
 
 async def message_callback(room: MatrixRoom, event: RoomMessageText):
@@ -172,19 +216,27 @@ async def message_callback(room: MatrixRoom, event: RoomMessageText):
     
     # Skip if no connection timestamp established
     if connection_timestamp is None:
+        print("No connection timestamp - skipping message")
         return
     
     try:
-        # Get message timestamp
+        # Get message timestamp (already in milliseconds from Matrix server)
         message_timestamp = event.server_timestamp
         
-        # Only respond to messages sent after connection
+        print(f"Message timestamp: {message_timestamp}, Connection timestamp: {connection_timestamp}")
+        
+        # Skip our own timestamp sync messages
+        if hasattr(event, 'body') and event.body.startswith("__TIMESTAMP_SYNC__"):
+            print("Skipping timestamp sync message")
+            return
+        
+        # Only respond to messages sent after connection (both timestamps are in milliseconds)
         if message_timestamp <= connection_timestamp:
-            print(f"Ignoring old message: {event.body}")
+            print(f"Ignoring old message (sent before connection): {event.body}")
             return
         
         message = event.body.strip()
-        print(f"Received message: {message}")
+        print(f"Processing new message: {message}")
         
         # Process commands
         response = await process_command(message)
@@ -311,18 +363,18 @@ async def main():
         
         print(f"Logged in successfully as {USERNAME}")
         
-        # Sync with server time and set connection timestamp
-        await sync_with_server_time()
-        
-        # Set up message callback
-        client.add_event_callback(message_callback, RoomMessageText)
-        
         # Join the room if not already joined
         try:
             await client.join(ROOM_ID)
             print(f"Joined room: {ROOM_ID}")
         except Exception as e:
             print(f"Note: Could not join room (might already be joined): {e}")
+        
+        # Set up message callback BEFORE establishing timestamp
+        client.add_event_callback(message_callback, RoomMessageText)
+        
+        # Establish connection timestamp using Matrix server time
+        await establish_connection_timestamp()
         
         print("Bot is now online and ready!")
         
